@@ -1,0 +1,401 @@
+#!/opt/bin/bash
+#
+#^^^^^^^^^^^^^^ set this to the correct path to bash on your system!
+#
+# Updated: 10/08/2006 by Brad House (brad <at> monetra <dot> com)
+# ./callerid_shell.agi "phonenum" "lookup order" "manual name"
+# Updated: 10-Oct-2008 by Konstantin Laufer (laufer <at> cs <dot> luc <dot> edu)
+#   to work with current versions of 411 and anywho
+# Updated: 24-Oct-2008 by Konstantin Laufer (laufer <at> cs <dot> luc <dot> edu)
+#   not to look up non-numeric CID information (e.g. from incoming VoIP calls)
+#   added support for whitepages
+# Updated: 31-Jan-2011 by Konstantin Laufer (laufer <at> cs <dot> luc <dot> edu)
+#   removed defunct google reverse lookup from default list
+#   added support for manual deletion of entries
+# Updated: 2-May-2014 by Konstantin Laufer (laufer <at> cs <dot> luc <dot> edu
+#   to work better with Entware
+#
+# Requires: CURL (http://curl.haxx.se/)
+#           SQLite3 [Only required if using database cache] 
+#                   (http://www.sqlite.org)
+#
+# Script should be installed to Asterisk AGI script directory
+# (usually /usr/share/asterisk/agi-bin/)
+#
+# If using extensions.conf, call like:
+#		exten => s,1,AGI(callerid_shell.agi|${CALLERIDNUM})
+#		exten => s,2,NoOp(AGI Returned ${lookupname})
+#		exten => s,3,Set(CALLERID(name)=${lookupname})
+# 
+# If using extensions.ael (AEL), call like:
+#		AGI(callerid_shell.agi|${CALLERIDNUM});
+#		NoOp(AGI Returned ${lookupname});
+#		Set(CALLERID(name)=${lookupname});
+#
+#
+# Lookup order may contain a space separated list of:
+#    google  - google.com lookup (fastest)
+#    whitepages - whitepages.com lookup (most complete)
+#    411     - 411.com lookup (moderate speed)
+#    anywho  - anywho.com lookup (slowest)
+#    sqlite3 - Cached Database
+#    nanpa   - look up from database of NPA-NXX codes to find
+#		city and state of caller, can obtain latest
+#		list from: http://www.nanpa.com/reports/reports_cocodes_assign.html
+#		Just unzip the 'all states' version and point the nanpa_db
+#		variable below...
+#  You may also specify the special 'manual' key and the
+#  3rd arg 'manual name' in order to simply insert a static
+#  entry into the database cache.
+#
+# Examples:
+#    ./callerid_shell.agi 555-555-1212 manual "John Doe"
+#        - Will add entry into database cache as non-expiring
+#          for phone number 555-5551212 ...
+#    ./callerid_shell.agi 555-555-1212 manual
+#        - Will remove entry for phone number 555-5551212 from database cache
+#    ./callerid_shell.agi 555-555-1212
+#        - Will set variable 'lookupname' when it is done scanning
+#          the default 'lookup_order'
+
+# --------- SET THESE VARIABLES ---------
+
+# Order to follow to lookup callerid
+#  if using cache, sqlite3 should always be first,
+#  nanpa is typically last.  Space separated list.
+#  (warning, anywho is slow, recommended not to use them)
+
+#lookup_order="sqlite3 411 google nanpa"
+#lookup_order="sqlite3 google whitepages"
+#Google reverse lookup no longer works
+lookup_order="sqlite3 411"
+
+# Whether or not we want to auto-cache successful lookups
+cache_lookups=1
+
+# Whether or not to cache nanpa lookups 
+# (if enabled, must also have cache_lookups enabled)
+cache_nanpa=1
+
+# Expiration timeframe in seconds for cached lookups
+cache_expire=7776000  # 90 days
+
+# cURL command location (full path)
+curlcmd="/opt/bin/curl"
+
+# SQLite database location (full path)
+sqlite3db="/opt/lib/asterisk/agi-bin/callerid_sqlite3.db"
+
+# SQLite command
+sqlitecmd="/opt/bin/sqlite3"
+
+# Location of downloaded NANPA db/txt ...
+#  (download all states list from:
+#    http://www.nanpa.com/reports/reports_cocodes_assign.html
+#   and uncompress)
+nanpa_db="/opt/lib/asterisk/agi-bin/nanpa.txt"
+
+# Max length of display name
+max_length=18
+
+
+# --------------------- SCRIPT BELOW ------------------------
+
+replace_escaped_chars() {
+	data="$*"
+	data=`echo ${data} | sed -e 's/+/ /g'`
+	data=`echo ${data} | sed -e 's/%20/ /g'`
+	data=`echo ${data} | sed -e 's/%26/\&/g'`
+	echo "${data}"
+}
+
+get_rawnumber() {
+	mynum="${1}"
+	mynum=`echo "${mynum}" | sed -e 's/+1//g' | sed -e 's/ //g' | sed -e 's/-//g' | sed -e 's/(//g' | sed -e 's/)//g'`
+	firstnum=`echo "${mynum}" | head -c 1`
+	if [ "${firstnum}" = "1" ] ; then
+		mynum=`echo "${mynum}" | sed -e 's/1//'`
+	fi
+	echo "${mynum}"
+}
+
+get_areacode() {
+	mynum=`get_rawnumber "${1}" | head -c 3`
+	echo "${mynum}"
+}
+
+get_phonenum() {
+	areacode=`get_areacode "${1}"`
+	mynum=`get_rawnumber "${1}" | sed -e "s/${areacode}//"`
+	echo "${mynum}"
+}
+
+get_nxx() {
+	mynum=`get_phonenum "${1}" | head -c 3`
+	echo "${mynum}"
+}
+
+lookup_411() {
+	out=""
+	fname=""
+	lname=""
+	myname=""
+	url="http://www.411.com/search/ReversePhone?phone=${1}"
+	data=`${curlcmd} -s -m 2 -A Mozilla/4.0 "$url" | \
+		grep 'search_type=reversephone' | head -n 2 | tail -n 1`
+	myname=`echo ${data} | sed -e 's/.*">//' | sed -e 's/<\/a>//'`
+
+	if [ "${myname}" != "" ] ; then
+		myname=`replace_escaped_chars ${myname}`
+		echo "${myname}"
+	fi
+}
+
+lookup_whitepages() {
+	out=""
+	fname=""
+	lname=""
+	myname=""
+	url="http://www.whitepages.com/search/ReversePhone?full_phone==${1}"
+	data=`${curlcmd} -s -m 2 -A Mozilla/4.0 "$url" | grep 'AAMGNRC2' | head -n 1`
+	fname=`echo ${data} | sed -e 's/.*AAMGNRC1=//;s/\/.*//'`
+	lname=`echo ${data} | sed -e 's/.*AAMGNRC2=//;s/\/.*//'`
+
+	if [ "${lname}" != "" ] ; then
+	    lname=`replace_escaped_chars ${lname}`
+	    if [ "${fname}" != "" ] ; then
+		fname=`replace_escaped_chars ${fname}`
+		myname="${lname}, ${fname}"
+	    else
+    		myname="${lname}"
+	    fi
+	fi
+
+	if [ "${myname}" != "" ] ; then
+		echo "${myname}"
+	fi
+}
+
+lookup_google() {
+	data=""
+	myname=""
+
+	data=`${curlcmd} -s -m 2 -A Mozilla/4.0 http://www.google.com/search?q=phonebook:${1}`
+	myname=`echo ${data} | grep Results | sed -e 's/.*Results//g' | sed -e 's:.*<font size=-2><br></font><font size=-1>::g' | sed -e 's:<.*::g' | cut -d- -f1`
+	if [ "${myname}" = "" -o "${myname}" = " " ] ; then
+		# Layout change, let's try catching this one.
+		myname=`echo ${data} | grep Results | sed -e 's/.*Results//g' | sed -e 's:.*<font size=-2><br></font>::g' | sed -e 's:.*9><td>::' | sed -e 's:<.*::g' | cut -d- -f1`
+	fi
+
+	if [ "${myname}" != "" ] ; then
+		echo "${myname}"
+	fi
+}
+
+lookup_anywho() {
+	data=""
+	fname=""
+	lname=""
+	myname=""
+
+	areacode=`get_areacode ${1}`
+	phonenum=`get_phonenum ${1}`
+	url="http://www.anywho.com/qry/wp_rl?npa=${areacode}&telephone=${phonenum}&btnsubmit=Search"
+	data=`${curlcmd} -s -m 2 -A Mozilla/4.0 "$url" | fgrep '</B><BR>' | head -n 1`
+	if [ -z "${data}" ]; then
+	        echo ""
+		return
+	fi
+	myname=`echo ${data} | sed -e 's/.*<B>//g' | cut -d\< -f1`
+
+	if [ "${myname}" != "" ] ; then
+		echo "${myname}"
+	fi
+}
+
+lookup_sqlite3() {
+	areacode=`get_areacode ${1}`
+	phonenum=`get_phonenum ${1}`
+
+	if [ "${areacode}" = "" -o "${phonenum}" = "" ] ; then
+		return 1
+	fi
+
+	if [ ! -f ${sqlite3db} ] ; then
+		return 1
+	fi
+
+	curr_ts=`date +%s` # Current unix timestamp
+	myname=""
+
+	data=`${sqlitecmd} -list "${sqlite3db}" "SELECT calleridname,ts FROM callerid WHERE areacode=${areacode} AND phonenum=${phonenum};"`
+	if [ "$?" != "0" -o "${data}" = "" ] ; then
+		return 1
+	fi
+
+	while read x ; do
+		ts=`echo ${x} | cut -d\| -f2`
+		sql3_name=`echo ${x} | cut -d\| -f1`
+		mydiff=`expr "${curr_ts}" - "${ts}"`
+		if [ "${ts}" != "0" -a "${mydiff}" -gt "${cache_expire}" ] ; then
+			${sqlitecmd} "${sqlite3db}" "DELETE FROM callerid WHERE areacode=${areacode} AND phonenum=${phonenum} AND ts=${ts};"
+		else
+			if [ "${sql3_name}" != "" ] ; then
+				myname=${sql3_name}
+			fi
+		fi
+	done <<< "`echo "${data}"`"
+
+	if [ "${myname}" != "" ] ; then
+		echo "${myname}"
+	fi
+}
+
+lookup_nanpa() {
+	areacode=`get_areacode "${1}"`
+	phonenum=`get_phonenum "${1}"`
+	nxx=`get_nxx "${1}"`	
+	line=`grep "${areacode}-${nxx}" "${nanpa_db}"`
+	STATE=`echo "${line}" | cut -b 1-3 | sed 's/^[ ^t\x09]*//' | sed 's/[ ^t\x09]*$//'`
+	RATECENTER=`echo "${line}" | cut -b 79-90 | sed 's/^[ ^t\x09]*//' | sed 's/[ ^t\x09]*$//'`
+	if [ "${STATE}" != "" -a "${RATECENTER}" != "" ] ; then
+		echo "${RATECENTER}, ${STATE}"
+	fi
+}
+
+update_sqlite3() {
+	areacode=`get_areacode "${1}"`
+	phonenum=`get_phonenum "${1}"`
+	myname="${2}"
+	mywho="${3}"
+
+	if [ "${areacode}" = "" -o "${phonenum}" = "" ] ; then
+		return 1
+	fi
+
+	if [ ! -f "${sqlite3db}" ] ; then
+		${sqlitecmd} "${sqlite3db}" 'CREATE TABLE callerid (areacode INT, phonenum INT, ts BIGINT, calleridname TEXT, origin TEXT);'
+		if [ "$?" != "0" ] ; then
+			return 1
+		fi
+		${sqlitecmd} "${sqlite3db}" 'CREATE INDEX areacode_idx ON callerid(areacode);'
+		if [ "$?" != "0" ] ; then
+			return 1
+		fi
+		${sqlitecmd} "${sqlite3db}" 'CREATE INDEX phonenum_idx ON callerid(phonenum);'
+		if [ "$?" != "0" ] ; then
+			return 1
+		fi
+		${sqlitecmd} "${sqlite3db}" 'CREATE INDEX ts_idx ON callerid(ts);'
+		if [ "$?" != "0" ] ; then
+			return 1
+		fi
+		chmod 666 "${sqlite3db}"
+	else
+		# Clear any previous entry that may exist
+		${sqlitecmd} "${sqlite3db}" "DELETE FROM callerid WHERE areacode=${areacode} AND phonenum=${phonenum};" > /dev/null 2>&1
+	fi
+
+	if [ "${myname}" = "" ]; then
+		if [ "${mywho}" = "manual" ] ; then
+			# Leave it at the deletion
+			return 0
+		else
+			return 1
+		fi
+	fi
+
+	if [ "${mywho}" = "manual" ] ; then
+		curr_ts=0; # Non-expiring if manual
+	else
+		curr_ts=`date +%s`
+	fi
+	${sqlitecmd} "${sqlite3db}" "INSERT INTO callerid VALUES(${areacode}, ${phonenum}, ${curr_ts}, '${myname}', '${mywho}');"
+	if [ "$?" != "0" ] ; then
+		return 1
+	fi
+	return 0	
+}
+
+lookup_name() {
+	for x in ${1} ; do
+		lu_name=""
+		#echo "lookup via ${x}" 1>&2
+		case ${x} in
+			sqlite3)
+				lu_name=`lookup_sqlite3 "${2}"`
+			;;
+			411)
+				lu_name=`lookup_411 "${2}"`
+			;;
+			google)
+				lu_name=`lookup_google "${2}"`
+			;;
+			whitepages)
+				lu_name=`lookup_whitepages "${2}"`
+			;;
+			anywho)
+				lu_name=`lookup_anywho "${2}"`
+			;;
+			nanpa)
+				lu_name=`lookup_nanpa "${2}"`
+			;;
+			manual)
+				lu_name="${3}"
+			;;
+		esac
+		if [ "${lu_name}" != "" ] ; then
+			if [ "${x}" != "sqlite3" -a "${cache_lookups}" = "1" ] ; then
+				if [ "${x}" != "nanpa" -o "${cache_nanpa}" = "1" ] ; then
+					update_sqlite3 "${2}" "${lu_name}" "$x"
+				fi
+			fi
+			echo "${lu_name}"
+			return 0
+		elif [ "${x}" = "manual" ]; then
+			update_sqlite3 "${2}" "" "manual" 
+		fi 
+	done
+	return 0
+}
+
+is_validnumber() {
+        junk_chars="${1//[0-9\+\-\ ]}"
+        if [ "zzz${junk_chars}" == "zzz" ]; then 
+                return 0
+        fi
+        return 1
+}
+
+if [ "$#" -lt "1" ] ; then
+	echo "Usage: $0 phonenum [lookup_order] [manual_name]"
+	echo ""
+	echo "Phone Num  : phone number to look up"
+	echo "Lookup List: 411 anywho google nanpa sqlite3 whitepages"
+	echo "    default: ${lookup_order}"
+	echo "Manual Name: Enter if you want to add an entry to the sqlite3 cache"
+	echo ""
+	exit 1
+fi
+
+if [ "${2}" != "" ] ; then
+	lookup_order="${2}"
+fi
+if [ "${1}" != "" ] ; then
+        is_validnumber "${1}"
+        if [ "$?" == "0" ]; then
+	    name=`lookup_name "${lookup_order}" "${1}" "${3}"`
+	else
+	    name="${1}"
+        fi
+fi
+	
+# Truncate to max number of characters
+if [ "${name}" != "" ] ; then
+	name=`echo ${name} | head -c ${max_length}`
+fi
+
+echo "SET VARIABLE lookupname \"${name}\""
+read RESPONSE
+
+exit 0
