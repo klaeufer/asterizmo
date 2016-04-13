@@ -1,0 +1,1 @@
+Additional functionality for the Asterisk software telephony engine, especially of the kind that integrates GrandCentral and Gizmo5 in useful ways.
