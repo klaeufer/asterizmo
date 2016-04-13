@@ -1,4 +1,4 @@
-#!/opt/bin/bash
+#!/bin/bash
 #
 #^^^^^^^^^^^^^^ set this to the correct path to bash on your system!
 #
@@ -81,19 +81,19 @@ cache_nanpa=1
 cache_expire=7776000  # 90 days
 
 # cURL command location (full path)
-curlcmd="/opt/bin/curl"
+curlcmd="/usr/bin/curl"
 
 # SQLite database location (full path)
-sqlite3db="/opt/lib/asterisk/agi-bin/callerid_sqlite3.db"
+sqlite3db="/usr/share/asterisk/agi-bin/callerid_sqlite3.db"
 
 # SQLite command
-sqlitecmd="/opt/bin/sqlite3"
+sqlitecmd="/usr/bin/sqlite3"
 
 # Location of downloaded NANPA db/txt ...
 #  (download all states list from:
 #    http://www.nanpa.com/reports/reports_cocodes_assign.html
 #   and uncompress)
-nanpa_db="/opt/lib/asterisk/agi-bin/nanpa.txt"
+nanpa_db="/usr/share/asterisk/agi-bin/nanpa.txt"
 
 # Max length of display name
 max_length=18
